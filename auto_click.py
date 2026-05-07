@@ -210,10 +210,10 @@ class FastMatcher:
         use_core = is_item and not getattr(self, "liquid_mode", False)
         if use_core:
             # 针对 item：提取中心 50% 宽高的区域（面积 1/4）
-            core_x = int(w * 0.25)
-            core_y = int(h * 0.25)
             core_w = int(w * 0.50)
             core_h = int(h * 0.50)
+            core_x = int((w - core_w) / 2)
+            core_y = int((h - core_h) * 0.8)
         else:
             # 针对非 item (如 region, public 等)：使用完整图像
             core_x = 0
@@ -278,35 +278,43 @@ class FastMatcher:
             if x < 0 or y < 0 or x + w > screen_img.shape[1] or y + h > screen_img.shape[0]:
                 continue
 
-            # 取完整 ROI
-            roi = screen_img[y:y+h, x:x+w]
-            if roi.shape[:2] != (h, w):
+            # 提取与核心区域精准匹配的 ROI
+            core_roi = screen_img[max_loc[1]:max_loc[1]+core_h, max_loc[0]:max_loc[0]+core_w]
+            if core_roi.shape[:2] != (core_h, core_w):
                 continue
 
-            # 亮度过滤门
-            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            if mask is not None:
-                mean_target = cv2.mean(hsv_target[:, :, 2], mask=mask)[0]
-                mean_roi    = cv2.mean(hsv_roi[:, :, 2], mask=mask)[0]
+            # 准备核心区域的颜色计算数据
+            core_mask = mask[core_y:core_y+core_h, core_x:core_x+core_w] if mask is not None else None
+            hsv_core_target = cv2.cvtColor(core_target, cv2.COLOR_BGR2HSV)
+            hsv_core_roi = cv2.cvtColor(core_roi, cv2.COLOR_BGR2HSV)
+
+            # 亮度过滤门（仅在核心区域判定）
+            if core_mask is not None:
+                mean_target = cv2.mean(hsv_core_target[:, :, 2], mask=core_mask)[0]
+                mean_roi    = cv2.mean(hsv_core_roi[:, :, 2], mask=core_mask)[0]
             else:
-                mean_target = np.mean(hsv_target[:, :, 2])
-                mean_roi    = np.mean(hsv_roi[:, :, 2])
+                mean_target = np.mean(hsv_core_target[:, :, 2])
+                mean_roi    = np.mean(hsv_core_roi[:, :, 2])
                 
             v_diff = abs(mean_target - mean_roi)
             if v_diff > BRIGHTNESS_GATE:
                 print(f"  [候选{attempt}] score={max_val:.3f} V差={v_diff:.1f} 超出亮度门，已压制并跳过")
                 continue
 
-            # 通过亮度门：计算颜色辅助分
-            h1 = cv2.calcHist([hsv_target], [0, 1], mask, [30, 32], [0, 180, 0, 256])
-            h2 = cv2.calcHist([hsv_roi],    [0, 1], mask, [30, 32], [0, 180, 0, 256])
+            # 通过亮度门：计算颜色辅助分（仅在核心区域计算，彻底无视边缘的抗锯齿杂色）
+            h1 = cv2.calcHist([hsv_core_target], [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
+            h2 = cv2.calcHist([hsv_core_roi],    [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
             cv2.normalize(h1, h1)
             cv2.normalize(h2, h2)
             c_score = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
 
             # 融合得分
-            alpha, beta = 1, 0.1
-            final_score = alpha * max_val + beta * c_score
+            alpha, beta = 0.91, 0.09
+            
+            # 如果颜色相关性为负数（完全不匹配），将其截断为 0
+            c_score_clamped = max(0.0, c_score)
+            
+            final_score = alpha * max_val + beta * c_score_clamped
 
             print(f"  [候选{attempt}] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
 
@@ -349,7 +357,7 @@ def ensure_not_stopped():
 
 call_id = 0
 
-def _locate_image(image_path, confidence=0.86, timeout=10, min_conf=0.84, step=0.01, search_region=None):
+def _locate_image(image_path, confidence=0.86, timeout=10, min_conf=0.86, step=0.01, search_region=None):
     global call_id
     if matcher is None:
         print("错误: matcher 未初始化")
