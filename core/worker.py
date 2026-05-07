@@ -12,12 +12,14 @@ class TransportWorker(QThread):
     error = Signal(str)
     log = Signal(str)
 
-    def __init__(self, begin: str, end: str, item: str, times: int):
+    def __init__(self, begin: str, end: str, item: str, times: int, resolution: str, liquid_mode: bool = False):
         super().__init__()
         self.begin = begin
         self.end = end
         self.item = item
         self.times = times
+        self.resolution = resolution
+        self.liquid_mode = liquid_mode
 
     def run(self):
         buffer = io.StringIO()
@@ -26,7 +28,7 @@ class TransportWorker(QThread):
 
             auto_click.reset_stop()
             with redirect_stdout(buffer):
-                auto_click.run_transport(self.begin, self.end, self.item, self.times)
+                auto_click.run_transport(self.begin, self.end, self.item, self.times, self.resolution, liquid_mode=self.liquid_mode)
             output = buffer.getvalue().strip()
             if output:
                 self.log.emit(output)
@@ -52,14 +54,14 @@ class WorkerHandle(QObject):
         super().__init__()
         self.worker: TransportWorker | None = None
 
-    def start(self, begin: str, end: str, item: str, times: int):
+    def start(self, begin: str, end: str, item: str, times: int, resolution: str, liquid_mode: bool = False):
         try:
             if self.worker and self.worker.isRunning():
                 return False
         except RuntimeError:
             pass
 
-        self.worker = TransportWorker(begin, end, item, times)
+        self.worker = TransportWorker(begin, end, item, times, resolution, liquid_mode)
         self.worker.log.connect(self.log.emit)
         self.worker.finished_msg.connect(self._on_finished)
         self.worker.error.connect(self._on_error)

@@ -72,10 +72,10 @@ class EditorPage(QWidget):
         self.res_label = QLabel("当前分辨率: - x -")
         self.target_w_edit = QLineEdit()
         self.target_w_edit.setPlaceholderText("宽")
-        self.target_w_edit.setFixedWidth(60)
+        self.target_w_edit.setFixedWidth(80)
         self.target_h_edit = QLineEdit()
         self.target_h_edit.setPlaceholderText("高")
-        self.target_h_edit.setFixedWidth(60)
+        self.target_h_edit.setFixedWidth(80)
         self.apply_res_button = QPushButton("按分辨率缩放")
         self.apply_res_button.setCursor(Qt.PointingHandCursor)
         
