@@ -1,6 +1,8 @@
 PySide6>=6.7
 pyautogui
+pygetwindow
 opencv-python
 mss
 numpy
+Pillow
 pyinstaller

@@ -1,0 +1,9 @@
+.git/
+.idea/
+_pycache_/
+build_portable/
+dist/
+dist_portable/
+node_modules/
+temp/
+src-tauri/target/

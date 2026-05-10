@@ -1,4 +1,5 @@
 import pyautogui
+import pygetwindow as gw
 import time
 import sys
 import argparse
@@ -9,9 +10,10 @@ from collections import namedtuple
 import os
 import threading
 
+
 # --- 性能优化设置 ---
 pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0.1  
+pyautogui.PAUSE = 0.1
 Point = namedtuple('Point', ['x', 'y']) # 模拟 pyautogui 的坐标对象
 
 # 全局字典，保存每个图片的最佳置信度
@@ -23,10 +25,39 @@ class FastMatcher:
     """使用 mss + OpenCV 的高速匹配类"""
     def __init__(self, resolution="2560x1440"):
         self.sct = mss.mss()
-        monitor = self.sct.monitors[1]
-        full_w = monitor["width"]
-        full_h = monitor["height"]
+
+        target_monitor = self.sct.monitors[1]
+        if resolution == "自动检测" or resolution == "Auto":
+            # 尝试通过窗口标题查找游戏窗口
+            titles = ["endfield", "明日方舟：终末地", "Arknights: Endfield"]
+            target_win = None
+            for t in titles:
+                wins = gw.getWindowsWithTitle(t)
+                if wins:
+                    target_win = wins[0]
+                    break
+
+            if target_win:
+                # 寻找窗口中心点所在的显示器
+                cx, cy = target_win.left + target_win.width // 2, target_win.top + target_win.height // 2
+                for i, m in enumerate(self.sct.monitors):
+                    if i == 0: continue
+                    if (m["left"] <= cx < m["left"] + m["width"] and
+                        m["top"] <= cy < m["top"] + m["height"]):
+                        target_monitor = m
+                        break
+                print(f"自动检测: 发现游戏窗口 '{target_win.title}'")
+            else:
+                print("自动检测: 未发现游戏窗口，将使用主显示器")
+
+            resolution = f"{target_monitor['width']}x{target_monitor['height']}"
+            print(f"自动选择屏幕分辨率: {resolution}")
+
+        full_w = target_monitor["width"]
+        full_h = target_monitor["height"]
         self.full_w = full_w
+        self.mon_left = target_monitor["left"]
+        self.mon_top = target_monitor["top"]
 
         # 解析用户选择的分辨率，计算缩放因子
         res_parts = resolution.split('x')
@@ -37,16 +68,16 @@ class FastMatcher:
         # 1. 基础尺寸（原始的 76%x58%）
         self.rw = int(full_w * 0.76)
         base_rh = int(full_h * 0.58)
-        
-        # 2. 原始居中时的偏移量
-        self.rx = int((full_w - self.rw) / 2)
-        base_ry = int((full_h - base_rh) / 2)
-        
+
+        # 2. 原始居中时的偏移量 (增加显示器全局偏移)
+        self.rx = int((full_w - self.rw) / 2) + self.mon_left
+        base_ry = int((full_h - base_rh) / 2) + self.mon_top
+
         # 3. 上边增高 100 像素
         # 顶部偏移量减少 100 (向上延伸)
-        self.ry = max(0, base_ry - 100) 
+        self.ry = max(self.mon_top, base_ry - 100)
         # 总高度增加 200
-        self.rh = base_rh + 200 
+        self.rh = base_rh + 200
 
         # 构造搜索区域
         self.search_region = {
@@ -55,7 +86,7 @@ class FastMatcher:
             "width": self.rw,
             "height": self.rh
         }
-        print(f"区域调整：高度增加100px，当前区域 {self.rw}x{self.rh}，偏移({self.rx}, {self.ry})")
+        print(f"区域调整：当前区域 {self.rw}x{self.rh}，偏移({self.rx}, {self.ry})")
 
     def load_image(self, path):
         """预读图片 + 自动裁掉透明背景"""
@@ -69,16 +100,18 @@ class FastMatcher:
         except Exception as e:
             print(f"错误: 无法加载图片 {path}, 异常: {e}")
             return None
-            
+
         if img is None:
             print(f"错误: 无法加载图片 {path}")
             return None
 
         is_item = "item" in path.replace("\\", "/").split("/")
 
-        # 提前清理透明背景的杂色（Alpha 预乘）
+        # 提前清理透明背景（使用 Alpha 混合填充背景色为 RGB 50,50,50）
         if len(img.shape) == 3 and img.shape[2] == 4:
-            img[:, :, :3] = (img[:, :, :3].astype(float) * (img[:, :, 3:].astype(float) / 255.0)).astype(np.uint8)
+            alpha = img[:, :, 3:].astype(float) / 255.0
+            bg_color = 50.0
+            img[:, :, :3] = (img[:, :, :3].astype(float) * alpha + bg_color * (1.0 - alpha)).astype(np.uint8)
 
         # 强制检查并缩放 item 图片：基准为 2560x1440 屏幕下对应 128x128 的模版
         if is_item:
@@ -86,25 +119,32 @@ class FastMatcher:
             target_h = getattr(self, "target_h", 1440)
             target_item_w = int(128 * (target_w / 2560.0))
             target_item_h = int(128 * (target_h / 1440.0))
-            
+
             if img.shape[1] != target_item_w or img.shape[0] != target_item_h:
                 img = cv2.resize(img, (target_item_w, target_item_h), interpolation=cv2.INTER_AREA)
+        else:
+            # 2. 非 item 图片 (public, region)：按当前屏幕相对于 2560x1440 的比例进行等比缩放
+            if hasattr(self, "scale_factor") and self.scale_factor != 1.0:
+                new_w = int(img.shape[1] * self.scale_factor)
+                new_h = int(img.shape[0] * self.scale_factor)
+                if new_w > 0 and new_h > 0:
+                    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         # === 临时调试: 输出图片到 temp 文件夹 ===
-        if is_item:
-            try:
-                temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
-                os.makedirs(temp_dir, exist_ok=True)
-                base_name = os.path.basename(path)
-                name, ext = os.path.splitext(base_name)
-                res_key = f"{getattr(self, 'target_w', 2560)}x{getattr(self, 'target_h', 1440)}"
-                debug_path = os.path.join(temp_dir, f"scaled_{res_key}_{name}.png")
-                # 使用 imencode 支持含中文或特殊字符路径
-                _, encoded_img = cv2.imencode(".png", img)
-                encoded_img.tofile(debug_path)
-                print(f"[Debug] 已将加载的 item 图片保存至: {debug_path}")
-            except Exception as e:
-                print(f"[Debug] 调试图片保存失败 {path}: {e}")
+
+        try:
+            temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+            os.makedirs(temp_dir, exist_ok=True)
+            base_name = os.path.basename(path)
+            name, ext = os.path.splitext(base_name)
+            res_key = f"{getattr(self, 'target_w', 2560)}x{getattr(self, 'target_h', 1440)}"
+            debug_path = os.path.join(temp_dir, f"scaled_{res_key}_{name}.png")
+            # 使用 imencode 支持含中文或特殊字符路径
+            _, encoded_img = cv2.imencode(".png", img)
+            encoded_img.tofile(debug_path)
+            print(f"[Debug] 已将加载的 item 图片保存至: {debug_path}")
+        except Exception as e:
+            print(f"[Debug] 调试图片保存失败 {path}: {e}")
         # === 调试结束 ===
 
         # 获取图片高度和宽度
@@ -117,7 +157,7 @@ class FastMatcher:
             if img.shape[2] == 3:
                 alpha_channel = np.ones((h, w), dtype=np.uint8) * 255
                 img = cv2.merge((img, alpha_channel))
-            
+
             # 将底部 25% 的区域 alpha 设为 0
             mask_h = int(h * 0.75)
             img[mask_h:, :, 3] = 0
@@ -150,7 +190,7 @@ class FastMatcher:
             # 注意：matchTemplate 需要模板和底图通道数一致 (BGR 3通道)
             if len(img.shape) == 3 and img.shape[2] == 4:
                 img = img[:, :, :3]
-            
+
             image_obj_cache[path] = (img, None)
             return img, None
 
@@ -166,27 +206,27 @@ class FastMatcher:
         start_time = time.time()
         last_img = self.grab_screen_img()
         total_pixels = last_img.shape[0] * last_img.shape[1]
-        
+
         while time.time() - start_time < timeout:
             ensure_not_stopped()
             time.sleep(check_interval)
             curr_img = self.grab_screen_img()
-            
+
             # 计算两帧之间的差异
             diff = cv2.absdiff(last_img, curr_img)
             # 将彩色差异转为灰度并二值化（忽略亮度变化小于 25 的微小干扰）
             gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             _, thresh = cv2.threshold(gray_diff, 25, 255, cv2.THRESH_BINARY)
-            
+
             # 计算发生变化的像素点数
             changed_pixels = np.count_nonzero(thresh)
             change_ratio = changed_pixels / total_pixels
-            
+
             # 如果变化面积小于总面积的 tolerance%
             if change_ratio < tolerance:
                 print(f"画面静止，继续执行后续操作, 耗时: {time.time() - start_time}")
                 return True
-                
+
             last_img = curr_img
         return False
 
@@ -220,7 +260,7 @@ class FastMatcher:
             core_y = 0
             core_w = w
             core_h = h
-            
+
         # core_x = 0
         # core_y = 0
         # core_w = w
@@ -246,11 +286,12 @@ class FastMatcher:
 
         # 应用左右区域限制（在 NMS 之前直接过滤掉不属于该区域的位置）
         if search_region == "left":
-            limit_x_in_roi = int(self.full_w * 0.58 - self.rx - core_w // 2)
+            # 使用相对坐标计算限制 (减去屏幕全局偏移)
+            limit_x_in_roi = int(self.full_w * 0.58 - (self.rx - self.mon_left) - core_w // 2)
             if 0 < limit_x_in_roi < res_copy.shape[1]:
                 res_copy[:, limit_x_in_roi:] = -1
         elif search_region == "right":
-            limit_x_in_roi = int(self.full_w * 0.58 - self.rx - core_w // 2)
+            limit_x_in_roi = int(self.full_w * 0.42 - (self.rx - self.mon_left) - core_w // 2)
             if 0 < limit_x_in_roi < res_copy.shape[1]:
                 res_copy[:, :limit_x_in_roi] = -1
 
@@ -265,7 +306,7 @@ class FastMatcher:
             # 将核心区域的匹配坐标还原为完整模板的左上角坐标
             x = max_loc[0] - core_x
             y = max_loc[1] - core_y
-            
+
             # 压制当前找到的核心区域（防止死循环）
             yc, xc = max_loc[1], max_loc[0]
             y1 = max(0, yc - core_h // 2)
@@ -295,7 +336,7 @@ class FastMatcher:
             else:
                 mean_target = np.mean(hsv_core_target[:, :, 2])
                 mean_roi    = np.mean(hsv_core_roi[:, :, 2])
-                
+
             v_diff = abs(mean_target - mean_roi)
             if v_diff > BRIGHTNESS_GATE:
                 print(f"  [候选{attempt}] score={max_val:.3f} V差={v_diff:.1f} 超出亮度门，已压制并跳过")
@@ -310,10 +351,10 @@ class FastMatcher:
 
             # 融合得分
             alpha, beta = 0.91, 0.09
-            
+
             # 如果颜色相关性为负数（完全不匹配），将其截断为 0
             c_score_clamped = max(0.0, c_score)
-            
+
             final_score = alpha * max_val + beta * c_score_clamped
 
             print(f"  [候选{attempt}] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
@@ -357,12 +398,12 @@ def ensure_not_stopped():
 
 call_id = 0
 
-def _locate_image(image_path, confidence=0.86, timeout=10, min_conf=0.86, step=0.01, search_region=None):
+def _locate_image(image_path, confidence=0.86, timeout=10, min_conf=0.85, step=0.01, search_region=None):
     global call_id
     if matcher is None:
         print("错误: matcher 未初始化")
         return None, 0.0
-        
+
     call_id += 1
     cid = call_id
 
@@ -435,16 +476,18 @@ def locationReconfirm(args):
     ensure_not_stopped()
     print("重置位置...")
     click_image('./public/move.png')
-    # 鼠标移开防止遮挡图片
-    pyautogui.moveTo(100, 100) 
-    
+    # 鼠标移开防止遮挡图片 (移动到应用所在屏幕的 100, 100)
+    mon_l = getattr(matcher, "mon_left", 0)
+    mon_t = getattr(matcher, "mon_top", 0)
+    pyautogui.moveTo(mon_l + 100, mon_t + 100)
+
     # 逻辑判断：已经在起点还是需要移动
     posA, max_valA = _locate_image(os.path.dirname(args.begin)+'/already_in_'+os.path.basename(args.begin), timeout=5)
     pos, max_val = _locate_image(args.begin, timeout=5)
-    
+
     mva = max_valA if max_valA is not None else 0.0
     mv = max_val if max_val is not None else 0.0
-    
+
     if max_valA is None or mva < mv:
         print(f"未在起点，开始移动到 {args.begin}")
         pyautogui.rightClick()
@@ -452,23 +495,23 @@ def locationReconfirm(args):
     elif max_val is None or mva > mv:
         print(f"已在起点:{args.begin}")
         pyautogui.rightClick()
-        
+
 def findNeedItem(args):
     """寻找物品逻辑优化：在滚动时减小寻找等待时间"""
     if matcher is None: return False
-    
+
     loc, max_val = _locate_image('./public/listHead.png')
     if not loc: return False
-    
+
     target_w = getattr(matcher, "target_w", 2560)
     offset_x = int(800 * (target_w / 2560.0))
     pyautogui.moveTo(loc.x + offset_x, loc.y + 100)
     pyautogui.scroll(5000) # 先滚到最上面
-    
+
     # 保证滚动动画彻底完成后再进行后续的代码执行
     print("等待列表滚动到顶并静止...")
     matcher.wait_for_idle(timeout=10)
-    
+
     max_scroll = 15
     while max_scroll > 0:
         ensure_not_stopped()
@@ -505,14 +548,13 @@ def main(args):
     # 每次运行任务都实例化一个全新的 mss 内容上下文，防止 GDI 位图句柄在多线程重入时失效
     matcher = FastMatcher(getattr(args, 'resolution', '2560x1440'))
     matcher.liquid_mode = getattr(args, 'liquid_mode', False)
-    
-    reset_stop()
+
     print("准备开始... 2秒倒计时")
     time.sleep(2)
 
     locationReconfirm(args)
     findNeedItem(args)
-    
+
     for i in range(args.times):
         ensure_not_stopped()
         print(f"\n--- 循环 {i+1}/{args.times} ---")
@@ -520,7 +562,7 @@ def main(args):
         move(args.end)
         put(args.item)
         move(args.begin)
-        
+
     print("\n任务完成!")
     for img, conf in confidence_cache.items():
         print(f"  {img}: {conf:.2f}")
@@ -531,5 +573,6 @@ def run_transport(begin, end, item, times, resolution="2560x1440", liquid_mode=F
     main(args)
 
 if __name__ == "__main__":
+    reset_stop()
     args = get_args_parser().parse_args()
     main(args)
