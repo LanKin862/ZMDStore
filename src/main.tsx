@@ -90,13 +90,69 @@ function hotkeyFromEvent(event: React.KeyboardEvent<HTMLInputElement>) {
   return parts.join("+");
 }
 
+function parseInlineMarkdown(text: string): React.ReactNode[] {
+  const combinedRegex = /(\*\*.*?\*\*|==.*?==|\[.*?\]\(.*?\))/g;
+  const rawParts = text.split(combinedRegex);
+  let key = 0;
+  
+  return rawParts.map((part) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={key++}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("==") && part.endsWith("==")) {
+      return <mark key={key++} className="doc-highlight">{part.slice(2, -2)}</mark>;
+    }
+    if (part.startsWith("[") && part.includes("](")) {
+      const match = part.match(/\[(.*?)\]\((.*?)\)/);
+      if (match) {
+        return <a key={key++} href={match[2]} target="_blank" rel="noopener noreferrer" className="doc-link">{match[1]}</a>;
+      }
+    }
+    return part;
+  });
+}
+
+function MarkdownView({ content }: { content: string }) {
+  const lines = content.split("\n");
+  const elements: React.ReactNode[] = [];
+  let listItems: React.ReactNode[] = [];
+  let key = 0;
+
+  const flushList = () => {
+    if (listItems.length > 0) {
+      elements.push(<ul key={`ul-${key++}`} className="doc-list">{listItems}</ul>);
+      listItems = [];
+    }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith("###")) {
+      flushList();
+      elements.push(<h3 key={key++} className="doc-h3">{parseInlineMarkdown(line.slice(3).trim())}</h3>);
+    } else if (line.startsWith("+ ") || line.startsWith("- ")) {
+      listItems.push(<li key={key++} className="doc-li-item">{parseInlineMarkdown(line.slice(2).trim())}</li>);
+    } else if (line === "") {
+      // Empty line
+    } else {
+      flushList();
+      elements.push(<p key={key++} className="doc-p">{parseInlineMarkdown(line)}</p>);
+    }
+  }
+  flushList();
+
+  return <div className="doc-container">{elements}</div>;
+}
+
 function App() {
-  const [page, setPage] = useState<"transport" | "editor">("transport");
+  const [page, setPage] = useState<"transport" | "editor" | "document">("transport");
+  const [docContent, setDocContent] = useState<string>("正在加载文档...");
   const [resources, setResources] = useState<Resources>({ baseDir: "", items: [], regions: [] });
   const [selectedItem, setSelectedItem] = useState<Asset | null>(null);
   const [begin, setBegin] = useState("");
   const [end, setEnd] = useState("");
   const [times, setTimes] = useState(30);
+  const [moveToOverflow, setMoveToOverflow] = useState(false);
   const [resolution, setResolution] = useState("自动检测");
   const [hotkey, setHotkey] = useState("F8");
   const [liquidMode, setLiquidMode] = useState(false);
@@ -140,6 +196,9 @@ function App() {
 
   useEffect(() => {
     refresh().catch((e) => setLogs((old) => [...old, `资源加载失败: ${e}`]));
+    bridge<string>("read-document")
+      .then((content) => setDocContent(content))
+      .catch((e) => setDocContent(`读取文档失败: ${e}`));
     try {
       const stored = localStorage.getItem("zmdstore_saved_queues");
       if (stored) {
@@ -391,6 +450,7 @@ function App() {
         </div>
         <button className={page === "transport" ? "nav active" : "nav"} onClick={() => setPage("transport")}>运送任务</button>
         <button className={page === "editor" ? "nav active" : "nav"} onClick={() => openEditor()}>素材编辑</button>
+        <button className={page === "document" ? "nav active" : "nav"} onClick={() => setPage("document")}>使用文档</button>
         <div className="stat">
           <span>{resources.items.length}</span> item
           <span>{resources.regions.length}</span> region
@@ -417,7 +477,30 @@ function App() {
                 <div className="form-grid">
                   <label>起点<select value={begin} onChange={(e) => setBegin(e.target.value)}>{resources.regions.map((r) => <option key={r.path} value={r.path}>{r.name}</option>)}</select></label>
                   <label>终点<select value={end} onChange={(e) => setEnd(e.target.value)}>{resources.regions.map((r) => <option key={r.path} value={r.path}>{r.name}</option>)}</select></label>
-                  <label>次数<input type="number" min={1} max={999} value={times} onChange={(e) => setTimes(Number(e.target.value))} /></label>
+                  <div className="times-container-custom">
+                    <div className="times-label-row">
+                      <span>次数</span>
+                      <label className="check overflow-check-inline">
+                        <input type="checkbox" checked={moveToOverflow} onChange={(e) => {
+                          const checked = e.target.checked;
+                          setMoveToOverflow(checked);
+                          if (checked) {
+                            setTimes(999);
+                          }
+                        }} />
+                        <span>默认搬到溢出</span>
+                      </label>
+                    </div>
+                    <input type="number" min={1} max={999} value={times} onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setTimes(val);
+                      if (val !== 999) {
+                        setMoveToOverflow(false);
+                      } else {
+                        setMoveToOverflow(true);
+                      }
+                    }} />
+                  </div>
                   <label>停止快捷键<input value={hotkey} readOnly onKeyDown={(e) => {
                     const next = hotkeyFromEvent(e);
                     if (next) setHotkey(next);
@@ -500,8 +583,20 @@ function App() {
               }}>{logs.map((line, index) => <p key={index}>{line}</p>)}</div>
             </section>
           </>
+        ) : page === "editor" ? (
+          <Editor resources={resources} initial={editing} onDone={() => { setPage("transport"); refresh().catch((e) => setLogs((old) => [...old, `资源刷新失败: ${e}`])); }} />
         ) : (
-          <Editor resources={resources} initial={editing} onDone={() => { setPage("transport"); refresh().catch((e) => setLogs((old) => [...old, `璧勬簮鍒锋柊澶辫触: ${e}`])); }} />
+          <div className="doc-page-wrapper">
+            <header className="toolbar">
+              <div>
+                <h1>使用文档</h1>
+                <p>关于工具的使用说明及明日方舟：终末地仓库管理功能介绍。</p>
+              </div>
+            </header>
+            <section className="panel doc-panel">
+              <MarkdownView content={docContent} />
+            </section>
+          </div>
         )}
       </section>
     </main>

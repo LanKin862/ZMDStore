@@ -291,7 +291,8 @@ class FastMatcher:
             if 0 < limit_x_in_roi < res_copy.shape[1]:
                 res_copy[:, limit_x_in_roi:] = -1
         elif search_region == "right":
-            limit_x_in_roi = int(self.full_w * 0.42 - (self.rx - self.mon_left) - core_w // 2)
+            # 使用相对坐标计算限制 (以 58% 屏幕宽度为界限划分，右侧占 42%)
+            limit_x_in_roi = int(self.full_w * 0.58 - (self.rx - self.mon_left) - core_w // 2)
             if 0 < limit_x_in_roi < res_copy.shape[1]:
                 res_copy[:, :limit_x_in_roi] = -1
 
@@ -466,11 +467,26 @@ def ctrl_click_image(image_path, confidence=0.86, timeout=10, search_region=None
     ensure_not_stopped()
     location, max_val = _locate_image(image_path, confidence, timeout, search_region=search_region)
     if location:
+        # 确定实际生效的搜索区域类型，对点击坐标进行二次校验防护，防止边界重合时误操作
+        effective_region = search_region
+        if effective_region is None:
+            is_item = "item" in image_path.replace("\\", "/").split("/")
+            effective_region = "left" if is_item else "all"
+
+        if matcher is not None:
+            mid_x = matcher.mon_left + int(matcher.full_w * 0.58)
+            if effective_region == "right" and location.x < mid_x:
+                print(f"安全拦截: 虽匹配到 {image_path}，但坐标 {location.x} 位于左侧区域(X < 58%)，已忽略以防误进行[取出]操作")
+                return None
+            if effective_region == "left" and location.x >= mid_x:
+                print(f"安全拦截: 虽匹配到 {image_path}，但坐标 {location.x} 位于右侧区域(X >= 58%)，已忽略以防误进行[放回]操作")
+                return None
+
         _perform_ctrl_click(location)
         time.sleep(0.1)
         print(f"成功 Ctrl+点击 {image_path}")
-        return True
-    return False
+        return location
+    return None
 
 def locationReconfirm(args):
     ensure_not_stopped()
@@ -537,11 +553,67 @@ def move(image):
 
 def getItem(image):
     ensure_not_stopped()
-    ctrl_click_image(image)
+    return ctrl_click_image(image)
 
 def put(image):
     ensure_not_stopped()
-    ctrl_click_image(image, search_region="right")
+    return ctrl_click_image(image, search_region="right")
+
+def is_item_at_coordinate(image_path, target_pos, tolerance=15):
+    """确认对应坐标处是否为目标物品"""
+    if matcher is None:
+        return False
+    if not target_pos:
+        return False
+
+    target_data = matcher.load_image(image_path)
+    if target_data is None:
+        return False
+    target, _ = target_data
+    h, w = target.shape[:2]
+
+    # 获取当前整个搜索区域的截图
+    screen_img = matcher.grab_screen_img()
+    img_h, img_w = screen_img.shape[:2]
+
+    # 将屏幕绝对坐标转换为相对于 search_region 截图的局部坐标
+    rel_cx = target_pos.x - matcher.rx
+    rel_cy = target_pos.y - matcher.ry
+
+    # 定义包含特定坐标和 tolerance 冗余度的局部包围框
+    x1 = max(0, int(rel_cx - w // 2 - tolerance))
+    y1 = max(0, int(rel_cy - h // 2 - tolerance))
+    x2 = min(img_w, int(rel_cx + w // 2 + tolerance))
+    y2 = min(img_h, int(rel_cy + h // 2 + tolerance))
+
+    if x2 <= x1 or y2 <= y1 or (x2 - x1) < w or (y2 - y1) < h:
+        return False
+
+    roi = screen_img[y1:y2, x1:x2]
+
+    # 对物品应用蒙版和核心区域匹配以保证精确度
+    is_item = "item" in image_path.replace("\\", "/").split("/")
+    use_core = is_item and not getattr(matcher, "liquid_mode", False)
+    if use_core:
+        core_w = int(w * 0.50)
+        core_h = int(h * 0.50)
+        core_x = int((w - core_w) / 2)
+        core_y = int((h - core_h) * 0.8)
+    else:
+        core_x = 0
+        core_y = 0
+        core_w = w
+        core_h = h
+
+    core_target = target[core_y:core_y+core_h, core_x:core_x+core_w]
+    if roi.shape[0] < core_target.shape[0] or roi.shape[1] < core_target.shape[1]:
+        return False
+
+    res = cv2.matchTemplate(roi, core_target, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(res)
+
+    threshold = confidence_cache.get(image_path, 0.85)
+    return max_val >= threshold
 
 def main(args):
     global matcher
@@ -555,12 +627,51 @@ def main(args):
     locationReconfirm(args)
     findNeedItem(args)
 
+    target_item_pos = None
+
     for i in range(args.times):
         ensure_not_stopped()
         print(f"\n--- 循环 {i+1}/{args.times} ---")
-        getItem(args.item)
+        
+        # 在第二次及后续从起点仓库取走物品前，确认对应坐标处是否为目标物品
+        if i > 0 and target_item_pos:
+            if not is_item_at_coordinate(args.item, target_item_pos):
+                print("目标物品在起点仓库中已耗尽")
+                break
+
+        pos = getItem(args.item)
+        if i == 0:
+            target_item_pos = pos
+
         move(args.end)
         put(args.item)
+        
+        # 等待 UI 更新渲染完成
+        time.sleep(0.5)
+        
+        # 检测背包中（分割后的右侧区域）是否仍然存在目标物品
+        overflow_pos, _ = _locate_image(args.item, search_region="right")
+        if overflow_pos and overflow_pos.x >= matcher.mon_left + int(matcher.full_w * 0.58):
+            print(f"检测到背包（右侧区域）中仍有目标物品 {args.item}，说明该物品任务已溢出！")
+            print("正在将背包中多余的目标物品放回起点仓库中...")
+            move(args.begin)
+            
+            # 循环放回所有多余的目标物品，限制最多 30 次尝试以防死循环
+            put_back_count = 0
+            while put_back_count < 30:
+                ensure_not_stopped()
+                pos_back, _ = _locate_image(args.item, search_region="right")
+                if not pos_back or pos_back.x < matcher.mon_left + int(matcher.full_w * 0.58):
+                    break
+                # 调用 put 放回，若点击失败则退出，防止死循环
+                if not put(args.item):
+                    break
+                put_back_count += 1
+                time.sleep(0.5)
+            
+            print(f"已将多余物品放回起点仓库，共放回 {put_back_count} 次。任务提前完成。")
+            break
+        
         move(args.begin)
 
     print("\n任务完成!")

@@ -66,6 +66,8 @@ Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $publishDir "ZMDStore
 Copy-Item -LiteralPath "item" -Destination $resourceDir -Recurse -Force
 Copy-Item -LiteralPath "region" -Destination $resourceDir -Recurse -Force
 Copy-Item -LiteralPath "public" -Destination $resourceDir -Recurse -Force
+Copy-Item -LiteralPath "Document.md" -Destination $publishDir -Force
+Copy-Item -LiteralPath "Document.md" -Destination $resourceDir -Force
 
 @"
 ZMDStoreDesktop portable package

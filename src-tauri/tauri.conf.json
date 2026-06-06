@@ -33,7 +33,8 @@
       "../tauri_bridge.py",
       "../item",
       "../region",
-      "../public"
+      "../public",
+      "../Document.md"
     ],
     "icon": [
       "icons/icon.ico"

@@ -183,7 +183,7 @@ def run_batch(payload: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["resources", "image-data", "compose-liquid", "save-image", "delete-image", "run", "batch"])
+    parser.add_argument("command", choices=["resources", "image-data", "compose-liquid", "save-image", "delete-image", "run", "batch", "read-document"])
     parser.add_argument("--json", default="{}")
     args = parser.parse_args()
     payload = json.loads(args.json)
@@ -204,6 +204,12 @@ def main() -> int:
             run_transport(payload)
         elif args.command == "batch":
             run_batch(payload)
+        elif args.command == "read-document":
+            doc_path = BASE_DIR / "Document.md"
+            if doc_path.exists():
+                print(doc_path.read_text(encoding="utf-8"))
+            else:
+                print("Document.md not found.")
         return 0
     except KeyboardInterrupt:
         print("任务已停止", flush=True)
