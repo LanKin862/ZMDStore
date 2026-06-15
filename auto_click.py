@@ -107,11 +107,24 @@ class FastMatcher:
 
         is_item = "item" in path.replace("\\", "/").split("/")
 
-        # 提前清理透明背景（使用 Alpha 混合填充背景色为 RGB 50,50,50）
+        # 缩放前：仅填充完全透明的像素（alpha==0），用不透明区域的 BGR 均值。
+        # 半透明边缘像素（alpha 1~254）保留原始颜色——它们参与颜色直方图计算，
+        # 混入灰色会降低 color 得分。
+        # 同时对 alpha<=5 的像素归零，消灭 canvas 预乘 alpha 往返产生的量化噪点。
         if len(img.shape) == 3 and img.shape[2] == 4:
-            alpha = img[:, :, 3:].astype(float) / 255.0
-            bg_color = 50.0
-            img[:, :, :3] = (img[:, :, :3].astype(float) * alpha + bg_color * (1.0 - alpha)).astype(np.uint8)
+            alpha = img[:, :, 3]
+            # 消灭 canvas 量化噪点：极低 alpha 一律归零
+            noise_mask = alpha <= 5
+            img[noise_mask, 3] = 0
+            alpha = img[:, :, 3]  # 刷新
+            # 纯透明像素用主体均值填充（仅为了 resize 插值干净）
+            solid_mask = alpha == 255
+            if np.any(solid_mask):
+                mean_color = img[solid_mask][:, :3].mean(axis=0)
+            else:
+                mean_color = np.array([50.0, 50.0, 50.0])
+            transparent_mask = alpha == 0
+            img[transparent_mask, :3] = mean_color.astype(np.uint8)
 
         # 强制检查并缩放 item 图片：基准为 2560x1440 屏幕下对应 128x128 的模版
         if is_item:
@@ -266,8 +279,10 @@ class FastMatcher:
         # core_w = w
         # core_h = h
         core_target = target[core_y:core_y+core_h, core_x:core_x+core_w]
+        core_mask = mask[core_y:core_y+core_h, core_x:core_x+core_w] if mask is not None else None
 
         # === 临时调试: 输出核心区域图片到 temp 文件夹 ===
+        # 带 alpha 通道写入，透明区域在 PNG 中真正透明，而非显示灰色填充
         if is_item:
             try:
                 temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
@@ -275,13 +290,21 @@ class FastMatcher:
                 base_name = os.path.basename(image_path)
                 name, ext = os.path.splitext(base_name)
                 debug_path = os.path.join(temp_dir, f"core_{name}.png")
-                _, encoded_img = cv2.imencode(".png", core_target)
+                debug_img = (np.dstack((core_target, core_mask)) if core_mask is not None
+                             else core_target)
+                _, encoded_img = cv2.imencode(".png", debug_img)
                 encoded_img.tofile(debug_path)
             except Exception as e:
                 print(f"[Debug] 调试核心图片保存失败 {image_path}: {e}")
         # === 调试结束 ===
 
-        res = cv2.matchTemplate(screen_img, core_target, cv2.TM_CCOEFF_NORMED)
+        # 仅在 mask 含透明像素时才传 mask，避免无谓的性能开销
+        _use_mask = core_mask is not None and not np.all(core_mask)
+        res = cv2.matchTemplate(screen_img, core_target, cv2.TM_CCOEFF_NORMED,
+                                mask=core_mask if _use_mask else None)
+        # 带 mask 的 TM_CCOEFF_NORMED 在纯色背景区域可能产生 inf
+        if _use_mask:
+            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
         res_copy = res.copy()
 
         # 应用左右区域限制（在 NMS 之前直接过滤掉不属于该区域的位置）
@@ -325,8 +348,7 @@ class FastMatcher:
             if core_roi.shape[:2] != (core_h, core_w):
                 continue
 
-            # 准备核心区域的颜色计算数据
-            core_mask = mask[core_y:core_y+core_h, core_x:core_x+core_w] if mask is not None else None
+            # 准备核心区域的颜色计算数据（core_mask 已在循环外计算）
             hsv_core_target = cv2.cvtColor(core_target, cv2.COLOR_BGR2HSV)
             hsv_core_roi = cv2.cvtColor(core_roi, cv2.COLOR_BGR2HSV)
 
@@ -569,7 +591,7 @@ def is_item_at_coordinate(image_path, target_pos, tolerance=15):
     target_data = matcher.load_image(image_path)
     if target_data is None:
         return False
-    target, _ = target_data
+    target, mask = target_data
     h, w = target.shape[:2]
 
     # 获取当前整个搜索区域的截图
@@ -606,10 +628,15 @@ def is_item_at_coordinate(image_path, target_pos, tolerance=15):
         core_h = h
 
     core_target = target[core_y:core_y+core_h, core_x:core_x+core_w]
+    core_mask = mask[core_y:core_y+core_h, core_x:core_x+core_w] if mask is not None else None
     if roi.shape[0] < core_target.shape[0] or roi.shape[1] < core_target.shape[1]:
         return False
 
-    res = cv2.matchTemplate(roi, core_target, cv2.TM_CCOEFF_NORMED)
+    _use_mask = core_mask is not None and not np.all(core_mask)
+    res = cv2.matchTemplate(roi, core_target, cv2.TM_CCOEFF_NORMED,
+                            mask=core_mask if _use_mask else None)
+    if _use_mask:
+        res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
     _, max_val, _, _ = cv2.minMaxLoc(res)
 
     threshold = confidence_cache.get(image_path, 0.85)
