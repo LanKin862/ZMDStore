@@ -23,6 +23,20 @@ image_obj_cache = {}
 
 class FastMatcher:
     """使用 mss + OpenCV 的高速匹配类"""
+    # 屏幕金字塔尺度（屏幕下采样比例）。物品在游戏 UI 中的实际渲染尺寸
+    # 可能与模板不一致（实验测得分离芯为模板的 1.2 倍），逐层匹配覆盖
+    # 0.71~1.0 倍屏幕尺度，即物品尺寸 1.0~1.4 倍模板的场景
+    PYRAMID_SCALES = [1.0, 0.9, 0.833, 0.77, 0.714]
+    # 层内融合得分达到该值即提前返回，普通物品在 1.0 层命中时零额外开销
+    EARLY_EXIT_SCORE = 0.90
+    # 两阶段匹配参数：
+    #   阶段1 无 mask 候选下限（宽松，宁多收）
+    CANDIDATE_FLOOR = 0.50
+    #   阶段2 带 mask 验证下限（严格，等价原 MIN_CANDIDATE_VAL）
+    VERIFY_GATE = 0.75
+    #   阶段1 每层候选数
+    TOP_N = 2
+
     def __init__(self, resolution="2560x1440"):
         self.sct = mss.mss()
 
@@ -243,6 +257,118 @@ class FastMatcher:
             last_img = curr_img
         return False
 
+    def _collect_candidates(self, screen_img, core_target, core_w, core_h, search_region):
+        """阶段1: 无 mask 全屏金字塔匹配，收集各层 top-N 候选（层坐标）。
+
+        mask 匹配每层约 600ms，无 mask 快一个数量级。先快速定位候选，
+        精确验证留给阶段2 的局部 ROI，从而避免全屏 mask 匹配的巨额开销。
+        返回 (去重后的候选列表, 层屏幕缓存)。
+        """
+        candidates = []
+        levels = {}
+        for scale in self.PYRAMID_SCALES:
+            if abs(scale - 1.0) < 1e-6:
+                level = screen_img
+            else:
+                sw = max(16, int(screen_img.shape[1] * scale))
+                sh = max(16, int(screen_img.shape[0] * scale))
+                level = cv2.resize(screen_img, (sw, sh), interpolation=cv2.INTER_AREA)
+            levels[scale] = level
+
+            res = cv2.matchTemplate(level, core_target, cv2.TM_CCOEFF_NORMED)
+            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            rcopy = res.copy()
+
+            # 左右区域限制（层坐标，限制线按层缩放）
+            if search_region in ("left", "right"):
+                limit_x = int((self.full_w * 0.58 - (self.rx - self.mon_left)) * scale - core_w // 2)
+                if 0 < limit_x < rcopy.shape[1]:
+                    if search_region == "left":
+                        rcopy[:, limit_x:] = -1
+                    else:
+                        rcopy[:, :limit_x] = -1
+
+            # 每层取 top-N 候选（NMS 压制）
+            for _ in range(self.TOP_N):
+                _, mv, _, ml = cv2.minMaxLoc(rcopy)
+                if mv < self.CANDIDATE_FLOOR:
+                    break
+                candidates.append((scale, ml[0], ml[1], mv))
+                y1 = max(0, ml[1] - core_h // 2)
+                y2 = min(rcopy.shape[0], ml[1] + core_h // 2 + 1)
+                x1 = max(0, ml[0] - core_w // 2)
+                x2 = min(rcopy.shape[1], ml[0] + core_w // 2 + 1)
+                rcopy[y1:y2, x1:x2] = -1
+
+        # 按原屏坐标 8px 网格去重（同一物品会跨层重复出现），保留得分最高者
+        buckets = {}
+        for scale, lx, ly, mv in candidates:
+            ox, oy = int(lx / scale), int(ly / scale)
+            key = (round(ox / 8.0), round(oy / 8.0))
+            if key not in buckets or mv > buckets[key][3]:
+                buckets[key] = (scale, lx, ly, mv)
+        return list(buckets.values()), levels
+
+    def _verify_candidate(self, level, scale, lx, ly, core_target, core_mask,
+                          core_x, core_y, core_w, core_h, w, h, h1):
+        """阶段2: 在候选所属尺度层的局部 ROI 上做带 mask 精确匹配 + 亮度门 + 颜色验证。
+
+        返回 (绝对坐标 Point, 融合得分) 或 (None, 0.0)。
+        """
+        BRIGHTNESS_GATE = 60
+        pad = 8
+        x1 = max(0, lx - pad)
+        y1 = max(0, ly - pad)
+        x2 = min(level.shape[1], lx + core_w + pad)
+        y2 = min(level.shape[0], ly + core_h + pad)
+        if x2 - x1 < core_w or y2 - y1 < core_h:
+            return None, 0.0
+        roi = level[y1:y2, x1:x2]
+
+        _use_mask = core_mask is not None and not np.all(core_mask)
+        res = cv2.matchTemplate(roi, core_target, cv2.TM_CCOEFF_NORMED,
+                                mask=core_mask if _use_mask else None)
+        if _use_mask:
+            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val < self.VERIFY_GATE:
+            print(f"  [验证 scale={scale:.3f} pos=({x1 + max_loc[0]},{y1 + max_loc[1]})] score={max_val:.3f} < {self.VERIFY_GATE}，拒绝")
+            return None, 0.0
+
+        core_roi = roi[max_loc[1]:max_loc[1] + core_h, max_loc[0]:max_loc[0] + core_w]
+        if core_roi.shape[:2] != (core_h, core_w):
+            return None, 0.0
+
+        hsv_core_target = cv2.cvtColor(core_target, cv2.COLOR_BGR2HSV)
+        hsv_core_roi = cv2.cvtColor(core_roi, cv2.COLOR_BGR2HSV)
+
+        # 亮度过滤门
+        if core_mask is not None:
+            mean_target = cv2.mean(hsv_core_target[:, :, 2], mask=core_mask)[0]
+            mean_roi    = cv2.mean(hsv_core_roi[:, :, 2], mask=core_mask)[0]
+        else:
+            mean_target = np.mean(hsv_core_target[:, :, 2])
+            mean_roi    = np.mean(hsv_core_roi[:, :, 2])
+
+        v_diff = abs(mean_target - mean_roi)
+        if v_diff > BRIGHTNESS_GATE:
+            print(f"  [验证 scale={scale:.3f} pos=({x1 + max_loc[0]},{y1 + max_loc[1]})] score={max_val:.3f} V差={v_diff:.1f} 超出亮度门")
+            return None, 0.0
+
+        # 颜色直方图相关性（h1 模板侧已预计算）
+        h2 = cv2.calcHist([hsv_core_roi], [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
+        cv2.normalize(h2, h2)
+        c_score = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+        final_score = 0.91 * max_val + 0.09 * max(0.0, c_score)
+
+        # 精确核心左上角（层坐标）→ 完整模板中心 → 原屏绝对坐标
+        exact_lx = x1 + max_loc[0]
+        exact_ly = y1 + max_loc[1]
+        abs_x = int((exact_lx - core_x + w // 2) / scale) + self.rx
+        abs_y = int((exact_ly - core_y + h // 2) / scale) + self.ry
+        print(f"  [验证 scale={scale:.3f} pos=({exact_lx},{exact_ly})] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
+        return Point(abs_x, abs_y), float(final_score)
+
     def locate_on_screen(self, screen_img, image_path, search_region="all"):
         target_data = self.load_image(image_path)
         if target_data is None:
@@ -252,12 +378,6 @@ class FastMatcher:
         is_item = "item" in image_path.replace("\\", "/").split("/")
 
         h, w = target.shape[:2]
-        BRIGHTNESS_GATE = 60
-        # 候选搜索参数：最多尝试 N 个候选位置，低于下限分直接停止
-        MAX_CANDIDATES = 8
-        MIN_CANDIDATE_VAL = 0.75  # 降低下限，容忍细节差异导致的基础低分
-
-        hsv_target = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
 
         # 核心匹配区域
         use_core = is_item and not getattr(self, "liquid_mode", False)
@@ -274,10 +394,6 @@ class FastMatcher:
             core_w = w
             core_h = h
 
-        # core_x = 0
-        # core_y = 0
-        # core_w = w
-        # core_h = h
         core_target = target[core_y:core_y+core_h, core_x:core_x+core_w]
         core_mask = mask[core_y:core_y+core_h, core_x:core_x+core_w] if mask is not None else None
 
@@ -298,95 +414,29 @@ class FastMatcher:
                 print(f"[Debug] 调试核心图片保存失败 {image_path}: {e}")
         # === 调试结束 ===
 
-        # 仅在 mask 含透明像素时才传 mask，避免无谓的性能开销
-        _use_mask = core_mask is not None and not np.all(core_mask)
-        res = cv2.matchTemplate(screen_img, core_target, cv2.TM_CCOEFF_NORMED,
-                                mask=core_mask if _use_mask else None)
-        # 带 mask 的 TM_CCOEFF_NORMED 在纯色背景区域可能产生 inf
-        if _use_mask:
-            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
-        res_copy = res.copy()
+        # 模板侧颜色数据预计算（验证阶段复用）
+        hsv_core_target = cv2.cvtColor(core_target, cv2.COLOR_BGR2HSV)
+        h1 = cv2.calcHist([hsv_core_target], [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
+        cv2.normalize(h1, h1)
 
-        # 应用左右区域限制（在 NMS 之前直接过滤掉不属于该区域的位置）
-        if search_region == "left":
-            # 使用相对坐标计算限制 (减去屏幕全局偏移)
-            limit_x_in_roi = int(self.full_w * 0.58 - (self.rx - self.mon_left) - core_w // 2)
-            if 0 < limit_x_in_roi < res_copy.shape[1]:
-                res_copy[:, limit_x_in_roi:] = -1
-        elif search_region == "right":
-            # 使用相对坐标计算限制 (以 58% 屏幕宽度为界限划分，右侧占 42%)
-            limit_x_in_roi = int(self.full_w * 0.58 - (self.rx - self.mon_left) - core_w // 2)
-            if 0 < limit_x_in_roi < res_copy.shape[1]:
-                res_copy[:, :limit_x_in_roi] = -1
+        # 两阶段匹配：
+        #   阶段1 无 mask 全屏金字塔找候选（快），阶段2 对候选局部 ROI 做
+        #   带 mask 精确验证（准）。既解决物品渲染尺寸与模板不一致的问题
+        #   （金字塔覆盖 1.0~1.4 倍），又避免全屏 mask 匹配的巨额开销。
+        candidates, levels = self._collect_candidates(screen_img, core_target, core_w, core_h, search_region)
+        print(f"  候选数: {len(candidates)}")
 
-        # 多候选 NMS 迭代
-        for attempt in range(MAX_CANDIDATES):
-            _, max_val, _, max_loc = cv2.minMaxLoc(res_copy)
+        best_pos, best_score = None, 0.0
+        for scale, lx, ly, _ in candidates:
+            pos, score = self._verify_candidate(levels[scale], scale, lx, ly, core_target, core_mask,
+                                                core_x, core_y, core_w, core_h, w, h, h1)
+            if pos is not None:
+                if score >= self.EARLY_EXIT_SCORE:
+                    return pos, score
+                if score > best_score:
+                    best_pos, best_score = pos, score
 
-            if max_val < MIN_CANDIDATE_VAL:
-                print(f"  [候选{attempt}] core_score={max_val:.3f} < {MIN_CANDIDATE_VAL}，停止搜索")
-                break
-
-            # 将核心区域的匹配坐标还原为完整模板的左上角坐标
-            x = max_loc[0] - core_x
-            y = max_loc[1] - core_y
-
-            # 压制当前找到的核心区域（防止死循环）
-            yc, xc = max_loc[1], max_loc[0]
-            y1 = max(0, yc - core_h // 2)
-            y2 = min(res_copy.shape[0], yc + core_h // 2 + 1)
-            x1 = max(0, xc - core_w // 2)
-            x2 = min(res_copy.shape[1], xc + core_w // 2 + 1)
-            res_copy[y1:y2, x1:x2] = -1
-
-            # 检查还原后的完整区域是否越界
-            if x < 0 or y < 0 or x + w > screen_img.shape[1] or y + h > screen_img.shape[0]:
-                continue
-
-            # 提取与核心区域精准匹配的 ROI
-            core_roi = screen_img[max_loc[1]:max_loc[1]+core_h, max_loc[0]:max_loc[0]+core_w]
-            if core_roi.shape[:2] != (core_h, core_w):
-                continue
-
-            # 准备核心区域的颜色计算数据（core_mask 已在循环外计算）
-            hsv_core_target = cv2.cvtColor(core_target, cv2.COLOR_BGR2HSV)
-            hsv_core_roi = cv2.cvtColor(core_roi, cv2.COLOR_BGR2HSV)
-
-            # 亮度过滤门（仅在核心区域判定）
-            if core_mask is not None:
-                mean_target = cv2.mean(hsv_core_target[:, :, 2], mask=core_mask)[0]
-                mean_roi    = cv2.mean(hsv_core_roi[:, :, 2], mask=core_mask)[0]
-            else:
-                mean_target = np.mean(hsv_core_target[:, :, 2])
-                mean_roi    = np.mean(hsv_core_roi[:, :, 2])
-
-            v_diff = abs(mean_target - mean_roi)
-            if v_diff > BRIGHTNESS_GATE:
-                print(f"  [候选{attempt}] score={max_val:.3f} V差={v_diff:.1f} 超出亮度门，已压制并跳过")
-                continue
-
-            # 通过亮度门：计算颜色辅助分（仅在核心区域计算，彻底无视边缘的抗锯齿杂色）
-            h1 = cv2.calcHist([hsv_core_target], [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
-            h2 = cv2.calcHist([hsv_core_roi],    [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
-            cv2.normalize(h1, h1)
-            cv2.normalize(h2, h2)
-            c_score = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
-
-            # 融合得分
-            alpha, beta = 0.91, 0.09
-
-            # 如果颜色相关性为负数（完全不匹配），将其截断为 0
-            c_score_clamped = max(0.0, c_score)
-
-            final_score = alpha * max_val + beta * c_score_clamped
-
-            print(f"  [候选{attempt}] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
-
-            abs_x = x + w // 2 + self.rx
-            abs_y = y + h // 2 + self.ry
-            return Point(abs_x, abs_y), float(final_score)
-
-        return None, 0.0
+        return best_pos, best_score
 
 
 # 初始化匹配器 (延迟到任务开始时在主逻辑中初始化)
