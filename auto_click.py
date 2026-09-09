@@ -14,7 +14,8 @@ import threading
 # --- 性能优化设置 ---
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.1
-Point = namedtuple('Point', ['x', 'y']) # 模拟 pyautogui 的坐标对象
+# scale: 命中时的金字塔层缩放比例, 供定点复查复用; 旧调用不受影响(默认 None)
+Point = namedtuple('Point', ['x', 'y', 'scale'], defaults=[None]) # 模拟 pyautogui 的坐标对象
 
 # 全局字典，保存每个图片的最佳置信度
 confidence_cache = {}
@@ -367,7 +368,7 @@ class FastMatcher:
         abs_x = int((exact_lx - core_x + w // 2) / scale) + self.rx
         abs_y = int((exact_ly - core_y + h // 2) / scale) + self.ry
         print(f"  [验证 scale={scale:.3f} pos=({exact_lx},{exact_ly})] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
-        return Point(abs_x, abs_y), float(final_score)
+        return Point(abs_x, abs_y, scale), float(final_score)
 
     def locate_on_screen(self, screen_img, image_path, search_region="all"):
         target_data = self.load_image(image_path)
@@ -513,6 +514,41 @@ def _locate_image(image_path, confidence=0.86, timeout=10, min_conf=0.85, step=0
     print(f"[{cid}] RETURN None (score<{min_conf:.2f})")
     return None, float(max_val)
 
+# === 位置缓存表: (image_path, 区域语义) -> Point(x, y, scale) ===
+# 首次实时匹配成功后记录; 后续同图同区域直接定点匹配(局部 ROI), 失败自动回退实时并刷新。
+# 位置固定元素(UI按钮/地图标记/仓库格子)由此免去每轮全屏金字塔查找。
+pos_cache = {}
+
+def _cache_region(image_path, search_region):
+    """归一化区域语义作为缓存 key 的一部分(left/right/all 位置互不通用)"""
+    if search_region is not None:
+        return search_region
+    is_item = "item" in image_path.replace("\\", "/").split("/")
+    return "left" if is_item else "all"
+
+def _smart_locate(image_path, confidence=0.86, timeout=10, min_conf=0.85, step=0.01, search_region=None):
+    """查表优先定位：记录过 → 定点匹配（局部 ROI，快且稳）；
+    定点未命中或未记录 → 全屏实时查找并刷新缓存。
+    返回 (Point(含scale), 得分) 或 (None, 得分)。"""
+    region = _cache_region(image_path, search_region)
+    key = (image_path, region)
+    cached = pos_cache.get(key)
+    if cached is not None:
+        pos, score = _locate_item_at(image_path, cached, scale=cached.scale)
+        if pos is not None:
+            pos_cache[key] = pos  # 逐轮微调, 吸收缓慢漂移
+            return pos, score
+        print(f"[查表] {image_path}[{region}] 定点未命中, 回退实时查找")
+
+    pos, max_val = _locate_image(image_path, confidence=confidence, timeout=timeout,
+                                 min_conf=min_conf, step=step, search_region=search_region)
+    if pos is not None:
+        pos_cache[key] = pos
+        print(f"[查表] 记录 {image_path}[{region}] -> ({pos.x},{pos.y}) scale={getattr(pos, 'scale', None)}")
+    else:
+        pos_cache.pop(key, None)  # 位置失效则清缓存, 避免反复定点 miss
+    return pos, max_val
+
 def _perform_click(location):
     """直接点击坐标，跳过平滑移动过程"""
     if location:
@@ -527,7 +563,7 @@ def _perform_ctrl_click(location):
 
 def click_image(image_path, confidence=0.86, timeout=10):
     ensure_not_stopped()
-    location, max_val = _locate_image(image_path, confidence, timeout)
+    location, max_val = _smart_locate(image_path, confidence, timeout)
     if location:
         _perform_click(location)
         time.sleep(0.1)
@@ -537,7 +573,7 @@ def click_image(image_path, confidence=0.86, timeout=10):
 
 def ctrl_click_image(image_path, confidence=0.86, timeout=10, search_region=None):
     ensure_not_stopped()
-    location, max_val = _locate_image(image_path, confidence, timeout, search_region=search_region)
+    location, max_val = _smart_locate(image_path, confidence, timeout, search_region=search_region)
     if location:
         # 确定实际生效的搜索区域类型，对点击坐标进行二次校验防护，防止边界重合时误操作
         effective_region = search_region
@@ -631,39 +667,23 @@ def put(image):
     ensure_not_stopped()
     return ctrl_click_image(image, search_region="right")
 
-def is_item_at_coordinate(image_path, target_pos, tolerance=15):
-    """确认对应坐标处是否为目标物品"""
-    if matcher is None:
-        return False
-    if not target_pos:
-        return False
+def _locate_item_at(image_path, target_pos, scale=None):
+    """定点查找：在记录的 (位置, 尺度) 附近做带 mask 匹配 + 亮度门 + 颜色验证。
+
+    仓库格子位置与物品渲染尺寸在任务期间固定，首次全屏命中后记录 scale，
+    后续用本函数在局部 ROI 上匹配，避免重复全屏金字塔的开销。
+    scale=None 时在金字塔全尺度内查找（用于首次定位的兜底）。
+    返回 (Point(x,y,scale), 融合得分) 或 (None, 0.0)。
+    """
+    if matcher is None or target_pos is None:
+        return None, 0.0
 
     target_data = matcher.load_image(image_path)
     if target_data is None:
-        return False
+        return None, 0.0
     target, mask = target_data
     h, w = target.shape[:2]
 
-    # 获取当前整个搜索区域的截图
-    screen_img = matcher.grab_screen_img()
-    img_h, img_w = screen_img.shape[:2]
-
-    # 将屏幕绝对坐标转换为相对于 search_region 截图的局部坐标
-    rel_cx = target_pos.x - matcher.rx
-    rel_cy = target_pos.y - matcher.ry
-
-    # 定义包含特定坐标和 tolerance 冗余度的局部包围框
-    x1 = max(0, int(rel_cx - w // 2 - tolerance))
-    y1 = max(0, int(rel_cy - h // 2 - tolerance))
-    x2 = min(img_w, int(rel_cx + w // 2 + tolerance))
-    y2 = min(img_h, int(rel_cy + h // 2 + tolerance))
-
-    if x2 <= x1 or y2 <= y1 or (x2 - x1) < w or (y2 - y1) < h:
-        return False
-
-    roi = screen_img[y1:y2, x1:x2]
-
-    # 对物品应用蒙版和核心区域匹配以保证精确度
     is_item = "item" in image_path.replace("\\", "/").split("/")
     use_core = is_item and not getattr(matcher, "liquid_mode", False)
     if use_core:
@@ -672,25 +692,81 @@ def is_item_at_coordinate(image_path, target_pos, tolerance=15):
         core_x = int((w - core_w) / 2)
         core_y = int((h - core_h) * 0.8)
     else:
-        core_x = 0
-        core_y = 0
-        core_w = w
-        core_h = h
+        core_x, core_y, core_w, core_h = 0, 0, w, h
 
     core_target = target[core_y:core_y+core_h, core_x:core_x+core_w]
     core_mask = mask[core_y:core_y+core_h, core_x:core_x+core_w] if mask is not None else None
-    if roi.shape[0] < core_target.shape[0] or roi.shape[1] < core_target.shape[1]:
-        return False
-
     _use_mask = core_mask is not None and not np.all(core_mask)
-    res = cv2.matchTemplate(roi, core_target, cv2.TM_CCOEFF_NORMED,
-                            mask=core_mask if _use_mask else None)
-    if _use_mask:
-        res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
-    _, max_val, _, _ = cv2.minMaxLoc(res)
+
+    hsv_core_target = cv2.cvtColor(core_target, cv2.COLOR_BGR2HSV)
+    h1 = cv2.calcHist([hsv_core_target], [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(h1, h1)
+
+    screen_img = matcher.grab_screen_img()
+    img_h, img_w = screen_img.shape[:2]
+    rel_cx = target_pos.x - matcher.rx
+    rel_cy = target_pos.y - matcher.ry
+
+    # 原屏 ROI 半径：覆盖物品最大渲染尺寸(模板×1/scale) + 位置误差冗余
+    scales = [scale] if scale is not None else matcher.PYRAMID_SCALES
+    roi_r = int(w * 0.5 / min(scales)) + 20
+    x1 = max(0, rel_cx - roi_r)
+    y1 = max(0, rel_cy - roi_r)
+    x2 = min(img_w, rel_cx + roi_r)
+    y2 = min(img_h, rel_cy + roi_r)
+    if x2 - x1 < core_w or y2 - y1 < core_h:
+        return None, 0.0
+    roi_orig = screen_img[y1:y2, x1:x2]
 
     threshold = confidence_cache.get(image_path, 0.85)
-    return max_val >= threshold
+    BRIGHTNESS_GATE = 60
+    for s in scales:
+        if abs(s - 1.0) < 1e-6:
+            level = roi_orig
+        else:
+            sw = max(8, int(roi_orig.shape[1] * s))
+            sh = max(8, int(roi_orig.shape[0] * s))
+            level = cv2.resize(roi_orig, (sw, sh), interpolation=cv2.INTER_AREA)
+        if level.shape[0] < core_h or level.shape[1] < core_w:
+            continue
+
+        res = cv2.matchTemplate(level, core_target, cv2.TM_CCOEFF_NORMED,
+                                mask=core_mask if _use_mask else None)
+        if _use_mask:
+            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val < threshold:
+            continue
+
+        # 亮度门
+        core_roi = level[max_loc[1]:max_loc[1]+core_h, max_loc[0]:max_loc[0]+core_w]
+        if core_roi.shape[:2] != (core_h, core_w):
+            continue
+        hsv_core_roi = cv2.cvtColor(core_roi, cv2.COLOR_BGR2HSV)
+        if core_mask is not None:
+            mean_target = cv2.mean(hsv_core_target[:, :, 2], mask=core_mask)[0]
+            mean_roi    = cv2.mean(hsv_core_roi[:, :, 2], mask=core_mask)[0]
+        else:
+            mean_target = np.mean(hsv_core_target[:, :, 2])
+            mean_roi    = np.mean(hsv_core_roi[:, :, 2])
+        v_diff = abs(mean_target - mean_roi)
+        if v_diff > BRIGHTNESS_GATE:
+            print(f"  [定点 scale={s:.3f}] score={max_val:.3f} V差={v_diff:.1f} 超出亮度门")
+            continue
+
+        # 颜色直方图相关性
+        h2 = cv2.calcHist([hsv_core_roi], [0, 1], core_mask, [30, 32], [0, 180, 0, 256])
+        cv2.normalize(h2, h2)
+        c_score = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+        final_score = 0.91 * max_val + 0.09 * max(0.0, c_score)
+
+        # 层坐标还原原屏绝对坐标：物品在层上 = 模板 1:1，模板内偏移直接可用
+        abs_x = int(x1 + (max_loc[0] - core_x + w // 2) / s) + matcher.rx
+        abs_y = int(y1 + (max_loc[1] - core_y + h // 2) / s) + matcher.ry
+        print(f"  [定点 scale={s:.3f}] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
+        return Point(abs_x, abs_y, s), float(final_score)
+
+    return None, 0.0
 
 def main(args):
     global matcher
@@ -698,27 +774,29 @@ def main(args):
     matcher = FastMatcher(getattr(args, 'resolution', '2560x1440'))
     matcher.liquid_mode = getattr(args, 'liquid_mode', False)
 
+    # 新任务从零建表: 首轮全屏查找并记录各标签位置, 之后轮次查表定点
+    pos_cache.clear()
+
     print("准备开始... 2秒倒计时")
     time.sleep(2)
 
     locationReconfirm(args)
     findNeedItem(args)
 
-    target_item_pos = None
-
     for i in range(args.times):
         ensure_not_stopped()
         print(f"\n--- 循环 {i+1}/{args.times} ---")
-        
-        # 在第二次及后续从起点仓库取走物品前，确认对应坐标处是否为目标物品
-        if i > 0 and target_item_pos:
-            if not is_item_at_coordinate(args.item, target_item_pos):
+
+        # getItem: 查表定点优先（首轮全屏建表, 后续轮局部 ROI 命中即点）
+        pos = getItem(args.item)
+        if pos is None:
+            # 一次失败可能由 UI 动画/弹窗瞬态遮挡引起, 重试一次再判定耗尽
+            print("未取到目标物品, 1 秒后重试...")
+            time.sleep(1.0)
+            pos = getItem(args.item)
+            if pos is None:
                 print("目标物品在起点仓库中已耗尽")
                 break
-
-        pos = getItem(args.item)
-        if i == 0:
-            target_item_pos = pos
 
         move(args.end)
         put(args.item)
@@ -727,7 +805,7 @@ def main(args):
         time.sleep(0.5)
         
         # 检测背包中（分割后的右侧区域）是否仍然存在目标物品
-        overflow_pos, _ = _locate_image(args.item, search_region="right")
+        overflow_pos, _ = _smart_locate(args.item, search_region="right")
         if overflow_pos and overflow_pos.x >= matcher.mon_left + int(matcher.full_w * 0.58):
             print(f"检测到背包（右侧区域）中仍有目标物品 {args.item}，说明该物品任务已溢出！")
             print("正在将背包中多余的目标物品放回起点仓库中...")
@@ -737,7 +815,7 @@ def main(args):
             put_back_count = 0
             while put_back_count < 30:
                 ensure_not_stopped()
-                pos_back, _ = _locate_image(args.item, search_region="right")
+                pos_back, _ = _smart_locate(args.item, search_region="right")
                 if not pos_back or pos_back.x < matcher.mon_left + int(matcher.full_w * 0.58):
                     break
                 # 调用 put 放回，若点击失败则退出，防止死循环
