@@ -514,10 +514,21 @@ def _locate_image(image_path, confidence=0.86, timeout=10, min_conf=0.85, step=0
     print(f"[{cid}] RETURN None (score<{min_conf:.2f})")
     return None, float(max_val)
 
-# === 位置缓存表: (image_path, 区域语义) -> Point(x, y, scale) ===
+# === 位置缓存表: (image_path, 区域语义) -> CachedPos ===
 # 首次实时匹配成功后记录; 后续同图同区域直接定点匹配(局部 ROI), 失败自动回退实时并刷新。
 # 位置固定元素(UI按钮/地图标记/仓库格子)由此免去每轮全屏金字塔查找。
+CachedPos = namedtuple('CachedPos', ['x', 'y', 'scale'])
 pos_cache = {}
+
+# === 特征基线库: (image_path, 区域语义) -> (core_score, color_score) ===
+# 首次接受的匹配采集, 锚定"第一次搬运时找到的物品特征", 后续所有匹配(定点/全屏)
+# 均与其对比, 偏差过大即使分数达标也视为不同物品。独立于 pos_cache, 不随位置失效清除。
+feature_baseline = {}
+
+# 特征偏差容差（实测依据: 同物品正常波动 core <=0.01; 相似物品偏差 core >=0.036;
+# color 因悬停高亮等 UI 状态波动可达 0.13 且对相似物无区分力, 故放宽）
+FEATURE_TOLERANCE_CORE = 0.03
+FEATURE_TOLERANCE_COLOR = 0.15
 
 def _cache_region(image_path, search_region):
     """归一化区域语义作为缓存 key 的一部分(left/right/all 位置互不通用)"""
@@ -526,27 +537,61 @@ def _cache_region(image_path, search_region):
     is_item = "item" in image_path.replace("\\", "/").split("/")
     return "left" if is_item else "all"
 
+def _feature_ok(image_path, region, core_s, color_s):
+    """特征偏差校验: 与基线对比, 在容差内返回 True; 基线不存在时跳过校验返回 True。"""
+    baseline = feature_baseline.get((image_path, region))
+    if baseline is None:
+        return True
+    core_b, color_b = baseline
+    d_core = abs(core_s - core_b)
+    d_color = abs(color_s - color_b)
+    if d_core > FEATURE_TOLERANCE_CORE or d_color > FEATURE_TOLERANCE_COLOR:
+        print(f"[查表] {image_path}[{region}] 特征偏差过大 "
+              f"(core {core_b:.3f}->{core_s:.3f} Δ{d_core:.3f}, "
+              f"color {color_b:.3f}->{color_s:.3f} Δ{d_color:.3f}), 视为不同物品")
+        return False
+    return True
+
 def _smart_locate(image_path, confidence=0.86, timeout=10, min_conf=0.85, step=0.01, search_region=None):
     """查表优先定位：记录过 → 定点匹配（局部 ROI，快且稳）；
-    定点未命中或未记录 → 全屏实时查找并刷新缓存。
+    定点未命中、或特征偏差过大、或未记录 → 全屏实时查找（同样做特征校验）。
     返回 (Point(含scale), 得分) 或 (None, 得分)。"""
     region = _cache_region(image_path, search_region)
     key = (image_path, region)
     cached = pos_cache.get(key)
     if cached is not None:
-        pos, score = _locate_item_at(image_path, cached, scale=cached.scale)
+        pos, score, core_s, color_s = _locate_item_at(image_path, cached, scale=cached.scale)
         if pos is not None:
-            pos_cache[key] = pos  # 逐轮微调, 吸收缓慢漂移
-            return pos, score
-        print(f"[查表] {image_path}[{region}] 定点未命中, 回退实时查找")
+            if _feature_ok(image_path, region, core_s, color_s):
+                # 位置逐轮微调(吸收漂移), 基线保持首轮值不更新
+                pos_cache[key] = cached._replace(x=pos.x, y=pos.y, scale=pos.scale)
+                return pos, score
+            # 偏差过大 → 落入全屏回退（全屏命中后还会做一次同样的校验）
+        else:
+            print(f"[查表] {image_path}[{region}] 定点未命中, 回退实时查找")
 
     pos, max_val = _locate_image(image_path, confidence=confidence, timeout=timeout,
                                  min_conf=min_conf, step=step, search_region=search_region)
-    if pos is not None:
-        pos_cache[key] = pos
-        print(f"[查表] 记录 {image_path}[{region}] -> ({pos.x},{pos.y}) scale={getattr(pos, 'scale', None)}")
+    if pos is None:
+        pos_cache.pop(key, None)  # 位置失效则清位置缓存(特征基线保留)
+        return None, max_val
+
+    # 全屏命中：定点复检一次获取特征分量，并做基线校验
+    p2, s2, core2, color2 = _locate_item_at(image_path, pos, scale=getattr(pos, 'scale', None))
+    if p2 is not None:
+        if not _feature_ok(image_path, region, core2, color2):
+            # 全屏找到的候选特征同样偏离基线 → 不是目标物品，拒绝放行
+            return None, max_val
+        if (image_path, region) not in feature_baseline:
+            feature_baseline[(image_path, region)] = (float(core2), float(color2))
+            print(f"[查表] 记录 {image_path}[{region}] -> ({p2.x},{p2.y}) scale={p2.scale} "
+                  f"core={core2:.3f} color={color2:.3f} (特征基线)")
+        else:
+            print(f"[查表] 记录 {image_path}[{region}] -> ({p2.x},{p2.y}) scale={p2.scale}")
+        pos_cache[key] = CachedPos(p2.x, p2.y, p2.scale)
     else:
-        pos_cache.pop(key, None)  # 位置失效则清缓存, 避免反复定点 miss
+        pos_cache[key] = CachedPos(pos.x, pos.y, getattr(pos, 'scale', None))
+        print(f"[查表] 记录 {image_path}[{region}] -> ({pos.x},{pos.y}) (特征采集失败, 跳过校验)")
     return pos, max_val
 
 def _perform_click(location):
@@ -673,14 +718,14 @@ def _locate_item_at(image_path, target_pos, scale=None):
     仓库格子位置与物品渲染尺寸在任务期间固定，首次全屏命中后记录 scale，
     后续用本函数在局部 ROI 上匹配，避免重复全屏金字塔的开销。
     scale=None 时在金字塔全尺度内查找（用于首次定位的兜底）。
-    返回 (Point(x,y,scale), 融合得分) 或 (None, 0.0)。
+    返回 (Point(x,y,scale), 融合得分, core得分, color得分) 或 (None, 0.0, 0.0, 0.0)。
     """
     if matcher is None or target_pos is None:
-        return None, 0.0
+        return None, 0.0, 0.0, 0.0
 
     target_data = matcher.load_image(image_path)
     if target_data is None:
-        return None, 0.0
+        return None, 0.0, 0.0, 0.0
     target, mask = target_data
     h, w = target.shape[:2]
 
@@ -715,7 +760,7 @@ def _locate_item_at(image_path, target_pos, scale=None):
     x2 = min(img_w, rel_cx + roi_r)
     y2 = min(img_h, rel_cy + roi_r)
     if x2 - x1 < core_w or y2 - y1 < core_h:
-        return None, 0.0
+        return None, 0.0, 0.0, 0.0
     roi_orig = screen_img[y1:y2, x1:x2]
 
     threshold = confidence_cache.get(image_path, 0.85)
@@ -735,8 +780,8 @@ def _locate_item_at(image_path, target_pos, scale=None):
         if _use_mask:
             res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val < threshold:
-            continue
+        # 阈值检查统一放在 final_score 计算后（与全屏 _locate_image 口径一致），
+        # 避免 core 单独达标、但被低 color 拉低 final 的候选漏过
 
         # 亮度门
         core_roi = level[max_loc[1]:max_loc[1]+core_h, max_loc[0]:max_loc[0]+core_w]
@@ -760,13 +805,18 @@ def _locate_item_at(image_path, target_pos, scale=None):
         c_score = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
         final_score = 0.91 * max_val + 0.09 * max(0.0, c_score)
 
+        # final 阈值检查（与全屏 _locate_image 动态阈值口径一致）
+        if final_score < threshold:
+            print(f"  [定点 scale={s:.3f}] core={max_val:.3f} color={c_score:.3f} final={final_score:.3f} < {threshold:.2f}，拒绝")
+            continue
+
         # 层坐标还原原屏绝对坐标：物品在层上 = 模板 1:1，模板内偏移直接可用
         abs_x = int(x1 + (max_loc[0] - core_x + w // 2) / s) + matcher.rx
         abs_y = int(y1 + (max_loc[1] - core_y + h // 2) / s) + matcher.ry
         print(f"  [定点 scale={s:.3f}] core_score={max_val:.3f} V差={v_diff:.1f} color={c_score:.3f} final={final_score:.3f} ✓")
-        return Point(abs_x, abs_y, s), float(final_score)
+        return Point(abs_x, abs_y, s), float(final_score), float(max_val), float(c_score)
 
-    return None, 0.0
+    return None, 0.0, 0.0, 0.0
 
 def main(args):
     global matcher
@@ -774,8 +824,9 @@ def main(args):
     matcher = FastMatcher(getattr(args, 'resolution', '2560x1440'))
     matcher.liquid_mode = getattr(args, 'liquid_mode', False)
 
-    # 新任务从零建表: 首轮全屏查找并记录各标签位置, 之后轮次查表定点
+    # 新任务从零建表: 首轮全屏查找并记录各标签位置与特征基线, 之后轮次查表定点
     pos_cache.clear()
+    feature_baseline.clear()
 
     print("准备开始... 2秒倒计时")
     time.sleep(2)

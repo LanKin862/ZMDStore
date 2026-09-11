@@ -268,7 +268,7 @@ function App() {
     let containerName: string | undefined;
     if (liquidMode) {
       if (!container) {
-        setLogs((old) => [...old, "液体运输模式需要至少设置容器。"]);
+        setLogs((old) => [...old, "气液运输模式需要至少设置容器。"]);
         return null;
       }
       item = liquid ? await composeLiquidItem(liquid, container) : container.path;
@@ -510,7 +510,7 @@ function App() {
 
                 <div className="mode-row">
                   <h2>选择物品</h2>
-                  <label className="check"><input type="checkbox" checked={liquidMode} onChange={(e) => setLiquidMode(e.target.checked)} /> 液体运输模式</label>
+                  <label className="check"><input type="checkbox" checked={liquidMode} onChange={(e) => setLiquidMode(e.target.checked)} /> 气液运输模式</label>
                   {liquidMode && (
                     <div className="liquid-box">
                       <button disabled={!selectedItem} onClick={() => setLiquid(selectedItem)}>设为液体</button>
